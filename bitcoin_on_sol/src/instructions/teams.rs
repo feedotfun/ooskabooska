@@ -1,46 +1,25 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
-use anchor_spl::token::Mint;
 
 use crate::constants::*;
 use crate::errors::BitcoinError;
-use crate::events::{
-    InviteCreated, TeamCreated, TeamDisbanded, TeamMembershipChanged,
-};
-use crate::state::{Config, MinerState, Team, TeamInvite};
+use crate::events::{InviteCreated, TeamCreated, TeamDisbanded, TeamMembershipChanged};
+use crate::state::{Config, Team, TeamInvite, TeamNameRegistry, UserState};
 
-/// Realize a member's outstanding team earnings into its solo `pending` balance
-/// and remove its active hashrate contribution from the team. Shared by
-/// `leave_team` and `admin_kick_member`.
-fn detach_miner_from_team(miner: &mut MinerState, team: &mut Team) -> Result<()> {
-    if miner.active {
-        let owed = team
-            .acc_reward_per_hashrate
-            .checked_sub(miner.team_reward_debt)
-            .ok_or(BitcoinError::MathOverflow)?
-            .checked_mul(miner.hashrate as u128)
-            .ok_or(BitcoinError::MathOverflow)?
-            / ACC_SCALE;
-        miner.pending = miner
-            .pending
-            .checked_add(owed as u64)
-            .ok_or(BitcoinError::MathOverflow)?;
-        team.total_active_hashrate = team
-            .total_active_hashrate
-            .checked_sub(miner.hashrate)
-            .ok_or(BitcoinError::MathOverflow)?;
+/// Initialize a freshly-created (init_if_needed) UserState if it is blank.
+fn ensure_user_state(user_state: &mut UserState, owner: Pubkey, bump: u8) {
+    if user_state.owner == Pubkey::default() {
+        user_state.owner = owner;
+        user_state.bump = bump;
     }
-    miner.team = Pubkey::default();
-    miner.team_reward_debt = 0;
-    team.member_count = team.member_count.saturating_sub(1);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Create team (one per wallet, optional SOL fee)
+// Create team (one per wallet, optional SOL fee). The creator auto-joins.
 // ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
+#[instruction(name: String)]
 pub struct CreateTeam<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -59,6 +38,26 @@ pub struct CreateTeam<'info> {
     )]
     pub team: Account<'info, Team>,
 
+    /// Reserves the name globally: seeded by the name, so a duplicate name makes
+    /// this `init` fail and the whole instruction reverts.
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + TeamNameRegistry::INIT_SPACE,
+        seeds = [SEED_TEAM_NAME, name.as_bytes()],
+        bump
+    )]
+    pub name_registry: Account<'info, TeamNameRegistry>,
+
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + UserState::INIT_SPACE,
+        seeds = [SEED_USER, authority.key().as_ref()],
+        bump
+    )]
+    pub user_state: Account<'info, UserState>,
+
     /// Receives the creation fee. Must be the configured admin wallet.
     #[account(mut, address = config.admin @ BitcoinError::InvalidParam)]
     pub fee_destination: SystemAccount<'info>,
@@ -69,6 +68,10 @@ pub struct CreateTeam<'info> {
 pub fn create_team(ctx: Context<CreateTeam>, name: String) -> Result<()> {
     require!(ctx.accounts.config.teams_enabled, BitcoinError::TeamsDisabled);
     require!(is_valid_team_name(&name), BitcoinError::InvalidTeamName);
+
+    let user_state = &mut ctx.accounts.user_state;
+    ensure_user_state(user_state, ctx.accounts.authority.key(), ctx.bumps.user_state);
+    require!(!user_state.has_team(), BitcoinError::AlreadyInTeam);
 
     let fee = ctx.accounts.config.team_creation_fee_lamports;
     if fee > 0 {
@@ -89,13 +92,26 @@ pub fn create_team(ctx: Context<CreateTeam>, name: String) -> Result<()> {
     team.name = name;
     team.total_active_hashrate = 0;
     team.acc_reward_per_hashrate = 0;
-    team.member_count = 0;
+    team.member_count = 1; // creator is the first member
     team.bump = ctx.bumps.team;
+
+    let registry = &mut ctx.accounts.name_registry;
+    registry.team = team.key();
+    registry.bump = ctx.bumps.name_registry;
+
+    // Creator auto-joins their own team.
+    user_state.team = team.key();
 
     emit!(TeamCreated {
         team: team.key(),
         authority: team.authority,
         fee_paid: fee,
+    });
+    emit!(TeamMembershipChanged {
+        team: team.key(),
+        member: user_state.owner,
+        joined: true,
+        by_admin: false,
     });
     Ok(())
 }
@@ -112,8 +128,7 @@ pub struct InviteMember<'info> {
 
     pub team: Account<'info, Team>,
 
-    /// Seeded by the unique invite id, so the same id can never be issued twice
-    /// (a second init at this address fails).
+    /// Seeded by the unique invite id, so the same id can never be issued twice.
     #[account(
         init,
         payer = authority,
@@ -165,7 +180,7 @@ pub fn revoke_invite(_ctx: Context<RevokeInvite>, _invite_id: u64) -> Result<()>
 }
 
 // ---------------------------------------------------------------------------
-// Join / leave
+// Join / leave (wallet-level membership)
 // ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
@@ -177,22 +192,19 @@ pub struct JoinTeam<'info> {
     #[account(seeds = [SEED_CONFIG], bump = config.bump)]
     pub config: Account<'info, Config>,
 
-    pub nft_mint: Account<'info, Mint>,
-
     #[account(
-        mut,
-        seeds = [SEED_MINER, nft_mint.key().as_ref()],
-        bump = miner_state.bump,
-        constraint = miner_state.owner == owner.key() @ BitcoinError::NotNftOwner,
-        constraint = !miner_state.has_team() @ BitcoinError::AlreadyInTeam
+        init_if_needed,
+        payer = owner,
+        space = 8 + UserState::INIT_SPACE,
+        seeds = [SEED_USER, owner.key().as_ref()],
+        bump
     )]
-    pub miner_state: Account<'info, MinerState>,
+    pub user_state: Account<'info, UserState>,
 
     #[account(mut)]
     pub team: Account<'info, Team>,
 
     /// Whitelist proof: the invite must target this team and this wallet.
-    /// Reusable across the owner's NFTs; the team authority can `revoke_invite`.
     #[account(
         seeds = [SEED_INVITE, &invite_id.to_le_bytes()],
         bump = invite.bump,
@@ -200,24 +212,20 @@ pub struct JoinTeam<'info> {
         constraint = invite.invitee == owner.key() @ BitcoinError::InviteRequired
     )]
     pub invite: Account<'info, TeamInvite>,
+
+    pub system_program: Program<'info, System>,
 }
 
 pub fn join_team(ctx: Context<JoinTeam>, _invite_id: u64) -> Result<()> {
     let max_members = ctx.accounts.config.max_team_members as u32;
-    let miner = &mut ctx.accounts.miner_state;
-    let team = &mut ctx.accounts.team;
+    let user_state = &mut ctx.accounts.user_state;
+    ensure_user_state(user_state, ctx.accounts.owner.key(), ctx.bumps.user_state);
+    require!(!user_state.has_team(), BitcoinError::AlreadyInTeam);
 
+    let team = &mut ctx.accounts.team;
     require!(team.member_count < max_members, BitcoinError::TeamFull);
 
-    if miner.active {
-        team.total_active_hashrate = team
-            .total_active_hashrate
-            .checked_add(miner.hashrate)
-            .ok_or(BitcoinError::MathOverflow)?;
-    }
-    // Start the member with no claim on past team rewards.
-    miner.team_reward_debt = team.acc_reward_per_hashrate;
-    miner.team = team.key();
+    user_state.team = team.key();
     team.member_count = team
         .member_count
         .checked_add(1)
@@ -225,8 +233,7 @@ pub fn join_team(ctx: Context<JoinTeam>, _invite_id: u64) -> Result<()> {
 
     emit!(TeamMembershipChanged {
         team: team.key(),
-        nft_mint: miner.nft_mint,
-        owner: miner.owner,
+        member: user_state.owner,
         joined: true,
         by_admin: false,
     });
@@ -238,57 +245,41 @@ pub struct LeaveTeam<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    pub nft_mint: Account<'info, Mint>,
-
     #[account(
         mut,
-        seeds = [SEED_MINER, nft_mint.key().as_ref()],
-        bump = miner_state.bump,
-        constraint = miner_state.owner == owner.key() @ BitcoinError::NotNftOwner
+        seeds = [SEED_USER, owner.key().as_ref()],
+        bump = user_state.bump
     )]
-    pub miner_state: Account<'info, MinerState>,
+    pub user_state: Account<'info, UserState>,
 
     #[account(
         mut,
-        constraint = miner_state.team == team.key() @ BitcoinError::NotInTeam
+        constraint = user_state.team == team.key() @ BitcoinError::NotInTeam
     )]
     pub team: Account<'info, Team>,
 }
 
 pub fn leave_team(ctx: Context<LeaveTeam>) -> Result<()> {
-    let miner = &mut ctx.accounts.miner_state;
-    let team = &mut ctx.accounts.team;
-    let team_key = team.key();
-    let nft_mint = miner.nft_mint;
-    let owner = miner.owner;
+    // The owner cannot abandon their own team; they must disband it instead.
+    require!(
+        ctx.accounts.team.authority != ctx.accounts.owner.key(),
+        BitcoinError::OwnerCannotLeave
+    );
 
-    detach_miner_from_team(miner, team)?;
+    let team = &mut ctx.accounts.team;
+    let member_owner = ctx.accounts.user_state.owner;
+
+    // Membership is wallet-level; already-active miners keep their snapshotted
+    // team contribution and detach cleanly when deactivated.
+    ctx.accounts.user_state.team = Pubkey::default();
+    team.member_count = team.member_count.saturating_sub(1);
 
     emit!(TeamMembershipChanged {
-        team: team_key,
-        nft_mint,
-        owner,
+        team: team.key(),
+        member: member_owner,
         joined: false,
         by_admin: false,
     });
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Team name
-// ---------------------------------------------------------------------------
-
-#[derive(Accounts)]
-pub struct SetTeamName<'info> {
-    #[account(address = team.authority @ BitcoinError::Unauthorized)]
-    pub authority: Signer<'info>,
-    #[account(mut)]
-    pub team: Account<'info, Team>,
-}
-
-pub fn set_team_name(ctx: Context<SetTeamName>, name: String) -> Result<()> {
-    require!(is_valid_team_name(&name), BitcoinError::InvalidTeamName);
-    ctx.accounts.team.name = name;
     Ok(())
 }
 
@@ -306,27 +297,28 @@ pub struct AdminKickMember<'info> {
 
     #[account(
         mut,
-        constraint = miner_state.team == team.key() @ BitcoinError::NotInTeam
+        seeds = [SEED_USER, member.key().as_ref()],
+        bump = user_state.bump,
+        constraint = user_state.team == team.key() @ BitcoinError::NotInTeam
     )]
-    pub miner_state: Account<'info, MinerState>,
+    pub user_state: Account<'info, UserState>,
+
+    /// CHECK: The wallet being kicked; only used to derive its UserState PDA.
+    pub member: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub team: Account<'info, Team>,
 }
 
 pub fn admin_kick_member(ctx: Context<AdminKickMember>) -> Result<()> {
-    let miner = &mut ctx.accounts.miner_state;
     let team = &mut ctx.accounts.team;
-    let team_key = team.key();
-    let nft_mint = miner.nft_mint;
-    let owner = miner.owner;
-
-    detach_miner_from_team(miner, team)?;
+    let member_owner = ctx.accounts.user_state.owner;
+    ctx.accounts.user_state.team = Pubkey::default();
+    team.member_count = team.member_count.saturating_sub(1);
 
     emit!(TeamMembershipChanged {
-        team: team_key,
-        nft_mint,
-        owner,
+        team: team.key(),
+        member: member_owner,
         joined: false,
         by_admin: true,
     });
@@ -334,28 +326,50 @@ pub fn admin_kick_member(ctx: Context<AdminKickMember>) -> Result<()> {
 }
 
 #[derive(Accounts)]
-pub struct AdminDisbandTeam<'info> {
-    #[account(address = config.admin @ BitcoinError::Unauthorized)]
-    pub admin: Signer<'info>,
+pub struct DisbandTeam<'info> {
+    /// Either the team owner or the program admin may disband.
+    pub authority: Signer<'info>,
 
     #[account(seeds = [SEED_CONFIG], bump = config.bump)]
     pub config: Account<'info, Config>,
 
-    /// Rent is refunded to the original team owner. Disband only when empty
-    /// (kick all members first) so no miner is left pointing at a dead account.
+    /// Disband only when the owner is the last member (member_count == 1).
     #[account(
         mut,
         close = team_authority,
-        constraint = team.member_count == 0 @ BitcoinError::TeamNotEmpty
+        constraint = team.member_count <= 1 @ BitcoinError::TeamNotEmpty,
+        constraint = authority.key() == team.authority || authority.key() == config.admin
+            @ BitcoinError::Unauthorized
     )]
     pub team: Account<'info, Team>,
 
-    /// CHECK: Receives the team's rent refund; must match the team owner.
+    /// Frees the reserved name so it can be used again.
+    #[account(
+        mut,
+        close = team_authority,
+        seeds = [SEED_TEAM_NAME, team.name.as_bytes()],
+        bump = name_registry.bump,
+        constraint = name_registry.team == team.key() @ BitcoinError::InvalidParam
+    )]
+    pub name_registry: Account<'info, TeamNameRegistry>,
+
+    /// The owner's UserState, cleared so the owner is no longer "in a team".
+    #[account(
+        mut,
+        seeds = [SEED_USER, team.authority.as_ref()],
+        bump = owner_state.bump
+    )]
+    pub owner_state: Account<'info, UserState>,
+
+    /// CHECK: Receives the rent refund; must be the team owner.
     #[account(mut, address = team.authority @ BitcoinError::InvalidParam)]
     pub team_authority: UncheckedAccount<'info>,
 }
 
-pub fn admin_disband_team(ctx: Context<AdminDisbandTeam>) -> Result<()> {
+pub fn disband_team(ctx: Context<DisbandTeam>) -> Result<()> {
+    // Clear the owner's membership before the team account is closed.
+    ctx.accounts.owner_state.team = Pubkey::default();
+
     emit!(TeamDisbanded {
         team: ctx.accounts.team.key(),
         authority: ctx.accounts.team.authority,

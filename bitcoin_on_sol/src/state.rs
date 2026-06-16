@@ -82,7 +82,16 @@ pub struct UserState {
     pub active_count: u16,
     pub mint_nonce: u64,
     pub total_minted: u32,
+    /// The team this wallet belongs to, or Pubkey::default() when not in a team.
+    /// Membership is per wallet; a miner inherits this team when it is activated.
+    pub team: Pubkey,
     pub bump: u8,
+}
+
+impl UserState {
+    pub fn has_team(&self) -> bool {
+        self.team != Pubkey::default()
+    }
 }
 
 /// Per-NFT mining state. PDA [SEED_MINER, nft_mint].
@@ -127,6 +136,16 @@ pub struct Team {
     /// Accumulated reward per unit of hashrate, scaled by ACC_SCALE.
     pub acc_reward_per_hashrate: u128,
     pub member_count: u32,
+    pub bump: u8,
+}
+
+/// Registry entry that reserves a team name globally. PDA
+/// [SEED_TEAM_NAME, name] - because the name seeds the PDA, two teams can never
+/// share a name (the second `create_team` fails at init).
+#[account]
+#[derive(InitSpace)]
+pub struct TeamNameRegistry {
+    pub team: Pubkey,
     pub bump: u8,
 }
 

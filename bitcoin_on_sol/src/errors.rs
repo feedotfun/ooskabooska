@@ -62,6 +62,14 @@ pub enum BitcoinError {
     TeamFull,
     #[msg("Invite id must be a 10-digit number")]
     InvalidInviteId,
+    #[msg("The team owner cannot leave; disband the team instead")]
+    OwnerCannotLeave,
+    #[msg("A team with this name already exists")]
+    NameTaken,
+
+    // Mint limit
+    #[msg("This wallet has reached the 5 NFT mint limit")]
+    MintLimitReached,
 
     // Sacrifice / upgrade
     #[msg("Both NFTs must be the same tier")]

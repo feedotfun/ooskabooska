@@ -130,14 +130,16 @@ pub fn activate_miner(ctx: Context<Activate>) -> Result<()> {
         .checked_add(ACTIVATION_LOCK_SECONDS)
         .ok_or(BitcoinError::MathOverflow)?;
 
-    // Team accounting: count this miner's hashrate while active.
-    if miner.has_team() {
+    // Membership is wallet-level: this miner inherits its owner's current team
+    // and contributes its hashrate to that team's pool while active.
+    miner.team = user_state.team;
+    if user_state.has_team() {
         let team = ctx
             .accounts
             .team
             .as_mut()
             .ok_or(BitcoinError::NotInTeam)?;
-        require_keys_eq!(team.key(), miner.team, BitcoinError::NotInTeam);
+        require_keys_eq!(team.key(), user_state.team, BitcoinError::NotInTeam);
         team.total_active_hashrate = team
             .total_active_hashrate
             .checked_add(miner.hashrate)

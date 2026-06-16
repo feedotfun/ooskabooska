@@ -38,6 +38,9 @@ pub const BLOCK_KIND_BIG: u8 = 1;
 /// Max NFTs a single user may have active (mining) at once.
 pub const MAX_ACTIVE_PER_USER: u16 = 5;
 
+/// Max NFTs a single wallet may ever mint.
+pub const MAX_MINT_PER_WALLET: u32 = 5;
+
 /// Once a miner is activated it is locked (cannot be deactivated, and therefore
 /// cannot be sacrificed) for this many seconds.
 pub const ACTIVATION_LOCK_SECONDS: i64 = 12 * 60 * 60; // 12 hours
@@ -62,11 +65,15 @@ pub const DEFAULT_MAX_TEAM_MEMBERS: u8 = 5;
 pub const INVITE_ID_MIN: u64 = 1_000_000_000;
 pub const INVITE_ID_MAX: u64 = 9_999_999_999;
 
-/// Validates a team name: 1..=32 bytes, ASCII letters and digits only.
+/// Validates a team name: 1..=32 bytes, ASCII letters/digits and spaces only.
+/// Must contain at least one non-space character and may not start/end with a
+/// space (keeps the name-registry seed clean and avoids look-alike duplicates).
 pub fn is_valid_team_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_TEAM_NAME_LEN
-        && name.bytes().all(|b| b.is_ascii_alphanumeric())
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b' ')
 }
 
 /// Validates that an invite id is a 10-digit number.
@@ -88,6 +95,8 @@ pub const SEED_ROUND: &[u8] = b"round";
 pub const SEED_VAULT_AUTH: &[u8] = b"vault_auth";
 pub const SEED_MINT_AUTH: &[u8] = b"mint_auth";
 pub const SEED_INVITE: &[u8] = b"invite";
+/// Registry PDA that makes team names globally unique: [SEED_TEAM_NAME, name].
+pub const SEED_TEAM_NAME: &[u8] = b"team_name";
 
 /// Returns the tier id for a uniformly random value given the remaining
 /// per-tier supply. The pick is weighted by remaining counts, which makes the

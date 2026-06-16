@@ -89,8 +89,8 @@ pub struct InviteCreated {
 #[event]
 pub struct TeamMembershipChanged {
     pub team: Pubkey,
-    pub nft_mint: Pubkey,
-    pub owner: Pubkey,
+    /// The wallet whose membership changed.
+    pub member: Pubkey,
     /// true = joined, false = left/kicked.
     pub joined: bool,
     /// true when removed by an admin kick.

@@ -10,7 +10,7 @@ pub mod util;
 
 use instructions::*;
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("8ozisczXr88dAct4ZKn82EKMMoRYc5kE7Z9ML7Z36gsm");
 
 #[program]
 pub mod bitcoin_on_sol {
@@ -80,6 +80,16 @@ pub mod bitcoin_on_sol {
         instructions::mint::settle_mint(ctx, name, uri)
     }
 
+    /// Instant temporary mint (no VRF/Metaplex yet). Capped at 5 per wallet.
+    pub fn dev_mint(ctx: Context<DevMint>, mint_index: u64) -> Result<()> {
+        instructions::mint::dev_mint(ctx, mint_index)
+    }
+
+    /// Real single-tx Metaplex NFT mint (on-chain randomness). Capped at 5/wallet.
+    pub fn mint_nft(ctx: Context<MintNft>, name: String, uri: String) -> Result<()> {
+        instructions::mint::mint_nft(ctx, name, uri)
+    }
+
     // ---------------- Miner lifecycle ----------------
     pub fn activate_miner(ctx: Context<Activate>) -> Result<()> {
         instructions::lifecycle::activate_miner(ctx)
@@ -114,16 +124,12 @@ pub mod bitcoin_on_sol {
         instructions::teams::leave_team(ctx)
     }
 
-    pub fn set_team_name(ctx: Context<SetTeamName>, name: String) -> Result<()> {
-        instructions::teams::set_team_name(ctx, name)
-    }
-
     pub fn admin_kick_member(ctx: Context<AdminKickMember>) -> Result<()> {
         instructions::teams::admin_kick_member(ctx)
     }
 
-    pub fn admin_disband_team(ctx: Context<AdminDisbandTeam>) -> Result<()> {
-        instructions::teams::admin_disband_team(ctx)
+    pub fn disband_team(ctx: Context<DisbandTeam>) -> Result<()> {
+        instructions::teams::disband_team(ctx)
     }
 
     // ---------------- Sacrifice / upgrade ----------------

@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::keccak;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::metadata::mpl_token_metadata::types::{Collection, Creator, DataV2};
 use anchor_spl::metadata::{
@@ -13,7 +14,134 @@ use crate::events::{MintRequested, MintRevealed};
 use crate::state::{Config, MinerState, PendingMint, UserState};
 use crate::util::{expand_u64, read_randomness};
 
-pub const NFT_SYMBOL: &str = "BTCSOL";
+pub const NFT_SYMBOL: &str = "BOS";
+
+// ---------------------------------------------------------------------------
+// dev_mint: an instant, single-instruction mint used while the full VRF +
+// Metaplex flow is being finalized. It creates a "temporary" on-chain miner
+// (no SPL/Metaplex token yet) carrying its tier, hashpower and mining status so
+// the UI can show real, owned NFTs immediately. Tier is drawn from on-chain
+// pseudo-randomness, weighted by remaining supply, and capped at 5 per wallet.
+// ---------------------------------------------------------------------------
+
+#[derive(Accounts)]
+#[instruction(mint_index: u64)]
+pub struct DevMint<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [SEED_CONFIG],
+        bump = config.bump,
+        constraint = !config.paused @ BitcoinError::Paused
+    )]
+    pub config: Account<'info, Config>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + UserState::INIT_SPACE,
+        seeds = [SEED_USER, user.key().as_ref()],
+        bump
+    )]
+    pub user_state: Account<'info, UserState>,
+
+    /// Temporary miner record, seeded by [SEED_MINER, user, mint index]. Distinct
+    /// from real (Metaplex) miners which are seeded by their nft mint. The handler
+    /// requires `mint_index == user_state.total_minted` so indices stay sequential.
+    #[account(
+        init,
+        payer = user,
+        space = 8 + MinerState::INIT_SPACE,
+        seeds = [SEED_MINER, user.key().as_ref(), &mint_index.to_le_bytes()],
+        bump
+    )]
+    pub miner_state: Account<'info, MinerState>,
+
+    pub system_program: Program<'info, System>,
+}
+
+pub fn dev_mint(ctx: Context<DevMint>, mint_index: u64) -> Result<()> {
+    let config = &mut ctx.accounts.config;
+    let user_state = &mut ctx.accounts.user_state;
+
+    if user_state.owner == Pubkey::default() {
+        user_state.owner = ctx.accounts.user.key();
+        user_state.bump = ctx.bumps.user_state;
+    }
+
+    // Indices must be sequential so the PDA matches total_minted.
+    require!(
+        mint_index == user_state.total_minted as u64,
+        BitcoinError::InvalidParam
+    );
+    require!(
+        user_state.total_minted < MAX_MINT_PER_WALLET,
+        BitcoinError::MintLimitReached
+    );
+    require!(
+        config.minted_total < TOTAL_NFT_SUPPLY,
+        BitcoinError::SupplyExhausted
+    );
+
+    // On-chain pseudo-randomness. Not cryptographically secure (fine for the
+    // temporary mint); uniqueness across a multi-mint tx comes from the nonce.
+    let clock = Clock::get()?;
+    let nonce = user_state.total_minted as u64;
+    let h = keccak::hashv(&[
+        ctx.accounts.user.key().as_ref(),
+        &clock.slot.to_le_bytes(),
+        &clock.unix_timestamp.to_le_bytes(),
+        &nonce.to_le_bytes(),
+    ]);
+    let mut rb = [0u8; 8];
+    rb.copy_from_slice(&h.0[..8]);
+    let rand = u64::from_le_bytes(rb);
+
+    let tier = weighted_tier(rand, &config.tier_remaining).ok_or(BitcoinError::SupplyExhausted)?;
+    let ti = tier as usize;
+    config.tier_remaining[ti] = config.tier_remaining[ti]
+        .checked_sub(1)
+        .ok_or(BitcoinError::SupplyExhausted)?;
+    config.minted_total = config
+        .minted_total
+        .checked_add(1)
+        .ok_or(BitcoinError::MathOverflow)?;
+    let hashrate = TIER_HASHRATE[ti];
+
+    let miner_key = ctx.accounts.miner_state.key();
+    let miner = &mut ctx.accounts.miner_state;
+    miner.owner = ctx.accounts.user.key();
+    miner.nft_mint = miner_key; // placeholder until a real mint is attached
+    miner.tier = tier;
+    miner.hashrate = hashrate;
+    miner.active = false;
+    miner.tree_slot = 0;
+    miner.team = Pubkey::default();
+    miner.team_reward_debt = 0;
+    miner.pending = 0;
+    miner.blocks_won = 0;
+    miner.total_earned = 0;
+    miner.created_at = clock.unix_timestamp;
+    miner.lock_until = 0;
+    miner.bump = ctx.bumps.miner_state;
+
+    user_state.total_minted = user_state
+        .total_minted
+        .checked_add(1)
+        .ok_or(BitcoinError::MathOverflow)?;
+    user_state.mint_nonce = user_state.mint_nonce.saturating_add(1);
+
+    emit!(MintRevealed {
+        user: miner.owner,
+        nft_mint: miner.nft_mint,
+        tier,
+        hashrate,
+        minted_total: config.minted_total,
+    });
+    Ok(())
+}
 
 #[derive(Accounts)]
 pub struct RequestMint<'info> {
@@ -336,6 +464,222 @@ pub fn settle_mint(ctx: Context<SettleMint>, name: String, uri: String) -> Resul
 
     emit!(MintRevealed {
         user: ctx.accounts.recipient.key(),
+        nft_mint: miner.nft_mint,
+        tier,
+        hashrate,
+        minted_total: config.minted_total,
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mint_nft: real, single-transaction Metaplex NFT mint (no VRF, no collection).
+// The tier is drawn from on-chain pseudo-randomness, weighted by remaining
+// supply. The NFT carries a `uri` that the app serves with live attributes
+// (Rarity, Hashpower, Status, description). Capped at 5 per wallet.
+// ---------------------------------------------------------------------------
+
+#[derive(Accounts)]
+pub struct MintNft<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [SEED_CONFIG],
+        bump = config.bump,
+        constraint = !config.paused @ BitcoinError::Paused
+    )]
+    pub config: Account<'info, Config>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + UserState::INIT_SPACE,
+        seeds = [SEED_USER, user.key().as_ref()],
+        bump
+    )]
+    pub user_state: Account<'info, UserState>,
+
+    /// CHECK: PDA mint/update authority.
+    #[account(seeds = [SEED_MINT_AUTH], bump = config.mint_auth_bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = user,
+        mint::decimals = 0,
+        mint::authority = mint_authority,
+        mint::freeze_authority = mint_authority
+    )]
+    pub nft_mint: Account<'info, Mint>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = nft_mint,
+        associated_token::authority = user
+    )]
+    pub nft_token: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = user,
+        space = 8 + MinerState::INIT_SPACE,
+        seeds = [SEED_MINER, nft_mint.key().as_ref()],
+        bump
+    )]
+    pub miner_state: Account<'info, MinerState>,
+
+    /// CHECK: Created by Token Metadata CPI.
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+    /// CHECK: Created by Token Metadata CPI.
+    #[account(mut)]
+    pub master_edition: UncheckedAccount<'info>,
+
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+pub fn mint_nft(ctx: Context<MintNft>, name: String, uri: String) -> Result<()> {
+    let config = &mut ctx.accounts.config;
+    let user_state = &mut ctx.accounts.user_state;
+
+    if user_state.owner == Pubkey::default() {
+        user_state.owner = ctx.accounts.user.key();
+        user_state.bump = ctx.bumps.user_state;
+    }
+
+    require!(
+        user_state.total_minted < MAX_MINT_PER_WALLET,
+        BitcoinError::MintLimitReached
+    );
+    require!(
+        config.minted_total < TOTAL_NFT_SUPPLY,
+        BitcoinError::SupplyExhausted
+    );
+
+    // On-chain pseudo-randomness (fine for tier selection; the mint pubkey makes
+    // each draw unique within a multi-mint batch).
+    let clock = Clock::get()?;
+    let h = keccak::hashv(&[
+        ctx.accounts.nft_mint.key().as_ref(),
+        ctx.accounts.user.key().as_ref(),
+        &clock.slot.to_le_bytes(),
+        &clock.unix_timestamp.to_le_bytes(),
+        &(user_state.total_minted as u64).to_le_bytes(),
+    ]);
+    let mut rb = [0u8; 8];
+    rb.copy_from_slice(&h.0[..8]);
+    let rand = u64::from_le_bytes(rb);
+
+    let tier = weighted_tier(rand, &config.tier_remaining).ok_or(BitcoinError::SupplyExhausted)?;
+    let ti = tier as usize;
+    config.tier_remaining[ti] = config.tier_remaining[ti]
+        .checked_sub(1)
+        .ok_or(BitcoinError::SupplyExhausted)?;
+    config.minted_total = config
+        .minted_total
+        .checked_add(1)
+        .ok_or(BitcoinError::MathOverflow)?;
+    let hashrate = TIER_HASHRATE[ti];
+
+    let mint_seeds: &[&[u8]] = &[SEED_MINT_AUTH, &[config.mint_auth_bump]];
+    let signer = &[mint_seeds];
+
+    mint_to(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.nft_mint.to_account_info(),
+                to: ctx.accounts.nft_token.to_account_info(),
+                authority: ctx.accounts.mint_authority.to_account_info(),
+            },
+            signer,
+        ),
+        1,
+    )?;
+
+    let creators = vec![Creator {
+        address: ctx.accounts.mint_authority.key(),
+        verified: true,
+        share: 100,
+    }];
+
+    create_metadata_accounts_v3(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMetadataAccountsV3 {
+                metadata: ctx.accounts.metadata.to_account_info(),
+                mint: ctx.accounts.nft_mint.to_account_info(),
+                mint_authority: ctx.accounts.mint_authority.to_account_info(),
+                update_authority: ctx.accounts.mint_authority.to_account_info(),
+                payer: ctx.accounts.user.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+            signer,
+        ),
+        DataV2 {
+            name,
+            symbol: NFT_SYMBOL.to_string(),
+            uri,
+            seller_fee_basis_points: 0,
+            creators: Some(creators),
+            collection: None,
+            uses: None,
+        },
+        true,
+        true,
+        None,
+    )?;
+
+    create_master_edition_v3(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_metadata_program.to_account_info(),
+            CreateMasterEditionV3 {
+                edition: ctx.accounts.master_edition.to_account_info(),
+                mint: ctx.accounts.nft_mint.to_account_info(),
+                update_authority: ctx.accounts.mint_authority.to_account_info(),
+                mint_authority: ctx.accounts.mint_authority.to_account_info(),
+                payer: ctx.accounts.user.to_account_info(),
+                metadata: ctx.accounts.metadata.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                rent: ctx.accounts.rent.to_account_info(),
+            },
+            signer,
+        ),
+        Some(0),
+    )?;
+
+    let miner = &mut ctx.accounts.miner_state;
+    miner.owner = ctx.accounts.user.key();
+    miner.nft_mint = ctx.accounts.nft_mint.key();
+    miner.tier = tier;
+    miner.hashrate = hashrate;
+    miner.active = false;
+    miner.tree_slot = 0;
+    miner.team = Pubkey::default();
+    miner.team_reward_debt = 0;
+    miner.pending = 0;
+    miner.blocks_won = 0;
+    miner.total_earned = 0;
+    miner.created_at = clock.unix_timestamp;
+    miner.lock_until = 0;
+    miner.bump = ctx.bumps.miner_state;
+
+    user_state.total_minted = user_state
+        .total_minted
+        .checked_add(1)
+        .ok_or(BitcoinError::MathOverflow)?;
+
+    emit!(MintRevealed {
+        user: miner.owner,
         nft_mint: miner.nft_mint,
         tier,
         hashrate,
