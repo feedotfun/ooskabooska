@@ -7,10 +7,14 @@ use crate::state::{BlockRound, Config, Winner};
 use crate::tree::MinerTree;
 use crate::util::{expand_u64, read_randomness};
 
-fn kind_meta(kind: u8) -> Result<(i64, u8)> {
+/// VRF expansion index used to derive the reward percentage (kept clear of the
+/// winner-draw indices 0..winner_count).
+const BPS_DRAW_INDEX: u64 = 1_000;
+
+fn winners_for(kind: u8) -> Result<u8> {
     match kind {
-        BLOCK_KIND_SMALL => Ok((SMALL_BLOCK_INTERVAL, SMALL_BLOCK_WINNERS)),
-        BLOCK_KIND_BIG => Ok((BIG_BLOCK_INTERVAL, BIG_BLOCK_WINNERS)),
+        BLOCK_KIND_SMALL => Ok(SMALL_BLOCK_WINNERS),
+        BLOCK_KIND_BIG => Ok(BIG_BLOCK_WINNERS),
         _ => err!(BitcoinError::InvalidBlockKind),
     }
 }
@@ -21,7 +25,12 @@ pub struct CommitBlock<'info> {
     #[account(address = config.crank_authority @ BitcoinError::Unauthorized)]
     pub crank: Signer<'info>,
 
-    #[account(mut, seeds = [SEED_CONFIG], bump = config.bump)]
+    #[account(
+        mut,
+        seeds = [SEED_CONFIG],
+        bump = config.bump,
+        constraint = config.game_enabled @ BitcoinError::GameDisabled
+    )]
     pub config: Account<'info, Config>,
 
     #[account(
@@ -44,48 +53,29 @@ pub struct CommitBlock<'info> {
 
 pub fn commit_block(ctx: Context<CommitBlock>, kind: u8, index: u64) -> Result<()> {
     require!(!ctx.accounts.config.paused, BitcoinError::Paused);
-    let (interval, winner_count) = kind_meta(kind)?;
+    let winner_count = winners_for(kind)?;
     let now = Clock::get()?.unix_timestamp;
     let config = &mut ctx.accounts.config;
 
-    let (expected_index, last_ts) = if kind == BLOCK_KIND_BIG {
-        (config.big_block_index, config.last_big_ts)
+    let (expected_index, last_ts, interval) = if kind == BLOCK_KIND_BIG {
+        (config.big_block_index, config.last_big_ts, config.big_interval)
     } else {
-        (config.small_block_index, config.last_small_ts)
+        (config.small_block_index, config.last_small_ts, config.small_interval)
     };
     require!(index == expected_index, BitcoinError::InvalidParam);
     require!(now - last_ts >= interval, BitcoinError::BlockTooSoon);
-
-    // Compute per-winner reward with halving, clamped so the whole block fits
-    // within the remaining pool.
-    let base = if kind == BLOCK_KIND_BIG {
-        config.base_big_reward
-    } else {
-        config.base_small_reward
-    };
-    let halvings = if config.halving_interval == 0 {
-        0
-    } else {
-        (config.cycle_index / config.halving_interval).min(63)
-    };
-    let mut per = base >> halvings;
-    let max_per = config.pool_remaining / (winner_count as u64).max(1);
-    if per > max_per {
-        per = max_per;
-    }
 
     let round = &mut ctx.accounts.block_round;
     round.kind = kind;
     round.index = index;
     round.randomness = ctx.accounts.randomness.key();
     round.commit_slot = Clock::get()?.slot;
-    round.reward_each = per;
+    round.reward_each = 0; // computed at settle from the revealed VRF
     round.winner_count = winner_count;
     round.winners = Vec::new();
     round.settled = false;
     round.bump = ctx.bumps.block_round;
 
-    // Rate-limit the next commit of this kind.
     if kind == BLOCK_KIND_BIG {
         config.last_big_ts = now;
     } else {
@@ -95,7 +85,7 @@ pub fn commit_block(ctx: Context<CommitBlock>, kind: u8, index: u64) -> Result<(
     emit!(BlockCommitted {
         kind,
         index,
-        reward_each: per,
+        reward_each: 0,
         timestamp: now,
     });
     Ok(())
@@ -132,14 +122,52 @@ pub fn settle_block(ctx: Context<SettleBlock>, kind: u8, _index: u64) -> Result<
         &ctx.accounts.block_round.randomness,
     )?;
 
-    let per = ctx.accounts.block_round.reward_each;
+    // Reward = random % (in bps) of emission_base, halved by total_blocks,
+    // optionally multiplied, clamped to the remaining pool. All derived from the
+    // revealed VRF, so the amount is verifiable.
+    let config = &ctx.accounts.config;
+    let (bps_min, bps_max) = if kind == BLOCK_KIND_BIG {
+        (config.big_bps_min as u64, config.big_bps_max as u64)
+    } else {
+        (config.small_bps_min as u64, config.small_bps_max as u64)
+    };
+    let span = bps_max.saturating_sub(bps_min).saturating_add(1).max(1);
+    let bps = bps_min + (expand_u64(&value, BPS_DRAW_INDEX) % span);
+
+    let mut total = (config.emission_base as u128)
+        .checked_mul(bps as u128)
+        .ok_or(BitcoinError::MathOverflow)?
+        / BPS_DENOM as u128;
+
+    let halvings = if config.halving_interval == 0 {
+        0
+    } else {
+        (config.total_blocks / config.halving_interval).min(63)
+    };
+    total >>= halvings;
+
+    if config.multiplier_enabled {
+        total = total
+            .checked_mul(config.global_multiplier_bps as u128)
+            .ok_or(BitcoinError::MathOverflow)?
+            / BPS_DENOM as u128;
+    }
+
+    let pool = config.pool_remaining as u128;
+    if total > pool {
+        total = pool;
+    }
+
+    let winner_count = ctx.accounts.block_round.winner_count.max(1) as u128;
+    let per = (total / winner_count) as u64;
+
     let want = ctx.accounts.block_round.winner_count as u64;
     let now = Clock::get()?.unix_timestamp;
 
     let mut winners: Vec<Winner> = Vec::new();
     {
         let tree = ctx.accounts.miner_tree.load()?;
-        if tree.total > 0 {
+        if tree.total > 0 && per > 0 {
             for i in 0..want {
                 let r = expand_u64(&value, i) as u128;
                 let target = r % (tree.total as u128);
@@ -169,17 +197,17 @@ pub fn settle_block(ctx: Context<SettleBlock>, kind: u8, _index: u64) -> Result<
         .pool_remaining
         .checked_sub(payout_total)
         .ok_or(BitcoinError::PoolInsufficient)?;
+    config.total_blocks = config
+        .total_blocks
+        .checked_add(1)
+        .ok_or(BitcoinError::MathOverflow)?;
 
-    // Advance indices / cycle.
     if kind == BLOCK_KIND_BIG {
         config.big_block_index = config
             .big_block_index
             .checked_add(1)
             .ok_or(BitcoinError::MathOverflow)?;
-        config.cycle_index = config
-            .cycle_index
-            .checked_add(1)
-            .ok_or(BitcoinError::MathOverflow)?;
+        config.cycle_index = config.cycle_index.saturating_add(1);
     } else {
         config.small_block_index = config
             .small_block_index
@@ -188,6 +216,7 @@ pub fn settle_block(ctx: Context<SettleBlock>, kind: u8, _index: u64) -> Result<
     }
 
     let round = &mut ctx.accounts.block_round;
+    round.reward_each = per;
     round.winners = winners;
     round.settled = true;
     Ok(())

@@ -9,7 +9,7 @@ use anchor_spl::token::{mint_to, Mint, MintTo, Token, TokenAccount, Transfer, tr
 
 use crate::constants::*;
 use crate::errors::BitcoinError;
-use crate::state::Config;
+use crate::state::{Blacklist, Config};
 use crate::tree::MinerTree;
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -21,6 +21,8 @@ pub struct InitConfigParams {
     pub base_small_reward: u64,
     pub base_big_reward: u64,
     pub halving_interval: u64,
+    /// Token base-unit amount that block reward percentages apply to.
+    pub emission_base: u64,
 }
 
 #[derive(Accounts)]
@@ -92,6 +94,22 @@ pub fn initialize_config(ctx: Context<InitializeConfig>, params: InitConfigParam
     config.team_creation_fee_lamports = DEFAULT_TEAM_CREATION_FEE_LAMPORTS;
     config.max_team_members = DEFAULT_MAX_TEAM_MEMBERS;
     config.teams_enabled = true;
+
+    // Block timing + emission defaults (admin-adjustable).
+    config.small_interval = SMALL_BLOCK_INTERVAL;
+    config.big_interval = BIG_BLOCK_INTERVAL;
+    config.small_bps_min = DEFAULT_SMALL_BPS_MIN;
+    config.small_bps_max = DEFAULT_SMALL_BPS_MAX;
+    config.big_bps_min = DEFAULT_BIG_BPS_MIN;
+    config.big_bps_max = DEFAULT_BIG_BPS_MAX;
+    config.emission_base = params.emission_base;
+    config.total_blocks = 0;
+    config.global_multiplier_bps = DEFAULT_MULTIPLIER_BPS;
+    config.multiplier_enabled = false;
+    config.tier_hashrate = TIER_HASHRATE;
+    config.max_active_hr = DEFAULT_MAX_ACTIVE_HR;
+    config.game_enabled = true;
+
     config.paused = false;
     config.bump = ctx.bumps.config;
     config.vault_auth_bump = ctx.bumps.vault_authority;
@@ -324,5 +342,120 @@ pub fn set_team_params(
     config.team_creation_fee_lamports = creation_fee_lamports;
     config.max_team_members = max_members;
     config.teams_enabled = teams_enabled;
+    Ok(())
+}
+
+// ---------------- Game / emission tuning ----------------
+
+pub fn set_block_timing(
+    ctx: Context<AdminOnly>,
+    small_interval: i64,
+    big_interval: i64,
+) -> Result<()> {
+    require!(small_interval > 0 && big_interval > 0, BitcoinError::InvalidParam);
+    let config = &mut ctx.accounts.config;
+    config.small_interval = small_interval;
+    config.big_interval = big_interval;
+    Ok(())
+}
+
+pub fn set_reward_bps(
+    ctx: Context<AdminOnly>,
+    small_min: u16,
+    small_max: u16,
+    big_min: u16,
+    big_max: u16,
+) -> Result<()> {
+    require!(small_min <= small_max && big_min <= big_max, BitcoinError::InvalidParam);
+    let config = &mut ctx.accounts.config;
+    config.small_bps_min = small_min;
+    config.small_bps_max = small_max;
+    config.big_bps_min = big_min;
+    config.big_bps_max = big_max;
+    Ok(())
+}
+
+pub fn set_emission_base(ctx: Context<AdminOnly>, emission_base: u64) -> Result<()> {
+    ctx.accounts.config.emission_base = emission_base;
+    Ok(())
+}
+
+pub fn set_halving(ctx: Context<AdminOnly>, halving_interval: u64) -> Result<()> {
+    ctx.accounts.config.halving_interval = halving_interval;
+    Ok(())
+}
+
+pub fn set_multiplier(ctx: Context<AdminOnly>, enabled: bool, bps: u32) -> Result<()> {
+    let config = &mut ctx.accounts.config;
+    config.multiplier_enabled = enabled;
+    config.global_multiplier_bps = bps;
+    Ok(())
+}
+
+pub fn set_tier_hashrate(ctx: Context<AdminOnly>, hashrate: [u64; TIER_COUNT]) -> Result<()> {
+    ctx.accounts.config.tier_hashrate = hashrate;
+    Ok(())
+}
+
+pub fn set_max_active_hr(ctx: Context<AdminOnly>, max_active_hr: u64) -> Result<()> {
+    require!(max_active_hr > 0, BitcoinError::InvalidParam);
+    ctx.accounts.config.max_active_hr = max_active_hr;
+    Ok(())
+}
+
+pub fn set_game_enabled(ctx: Context<AdminOnly>, enabled: bool) -> Result<()> {
+    ctx.accounts.config.game_enabled = enabled;
+    Ok(())
+}
+
+// ---------------- Blacklist ----------------
+
+#[derive(Accounts)]
+#[instruction(target: Pubkey)]
+pub struct BlacklistAdd<'info> {
+    #[account(mut, address = config.admin @ BitcoinError::Unauthorized)]
+    pub admin: Signer<'info>,
+
+    #[account(seeds = [SEED_CONFIG], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + Blacklist::INIT_SPACE,
+        seeds = [SEED_BLACKLIST, target.as_ref()],
+        bump
+    )]
+    pub blacklist: Account<'info, Blacklist>,
+
+    pub system_program: Program<'info, System>,
+}
+
+pub fn blacklist_add(ctx: Context<BlacklistAdd>, target: Pubkey) -> Result<()> {
+    let bl = &mut ctx.accounts.blacklist;
+    bl.wallet = target;
+    bl.bump = ctx.bumps.blacklist;
+    Ok(())
+}
+
+#[derive(Accounts)]
+#[instruction(target: Pubkey)]
+pub struct BlacklistRemove<'info> {
+    #[account(mut, address = config.admin @ BitcoinError::Unauthorized)]
+    pub admin: Signer<'info>,
+
+    #[account(seeds = [SEED_CONFIG], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    #[account(
+        mut,
+        close = admin,
+        seeds = [SEED_BLACKLIST, target.as_ref()],
+        bump = blacklist.bump
+    )]
+    pub blacklist: Account<'info, Blacklist>,
+}
+
+pub fn blacklist_remove(_ctx: Context<BlacklistRemove>, _target: Pubkey) -> Result<()> {
     Ok(())
 }

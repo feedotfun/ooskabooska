@@ -1,17 +1,18 @@
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::metadata::mpl_token_metadata::types::{Collection, Creator, DataV2};
+use anchor_spl::metadata::mpl_token_metadata::types::{Creator, DataV2};
 use anchor_spl::metadata::{
-    burn_nft, create_master_edition_v3, create_metadata_accounts_v3, verify_sized_collection_item,
-    BurnNft, CreateMasterEditionV3, CreateMetadataAccountsV3, Metadata, VerifySizedCollectionItem,
+    burn_nft, create_master_edition_v3, create_metadata_accounts_v3, BurnNft,
+    CreateMasterEditionV3, CreateMetadataAccountsV3, Metadata,
 };
-use anchor_spl::token::{burn, mint_to, Burn, Mint, MintTo, Token, TokenAccount};
+use anchor_spl::token::{mint_to, transfer, Mint, MintTo, Token, TokenAccount, Transfer};
 
 use crate::constants::*;
 use crate::errors::BitcoinError;
 use crate::events::Sacrificed;
 use crate::instructions::mint::NFT_SYMBOL;
 use crate::state::{Config, MinerState};
+use crate::util::require_not_blacklisted;
 
 #[derive(Accounts)]
 pub struct Sacrifice<'info> {
@@ -22,7 +23,8 @@ pub struct Sacrifice<'info> {
         mut,
         seeds = [SEED_CONFIG],
         bump = config.bump,
-        constraint = !config.paused @ BitcoinError::Paused
+        constraint = !config.paused @ BitcoinError::Paused,
+        constraint = config.game_enabled @ BitcoinError::GameDisabled
     )]
     pub config: Account<'info, Config>,
 
@@ -33,23 +35,23 @@ pub struct Sacrifice<'info> {
     pub token_mint: Account<'info, Mint>,
 
     #[account(
-        mut,
-        constraint = user_token.mint == config.token_mint @ BitcoinError::MintMismatch,
-        constraint = user_token.owner == owner.key() @ BitcoinError::OwnerMismatch
+        init_if_needed,
+        payer = owner,
+        associated_token::mint = token_mint,
+        associated_token::authority = owner
     )]
     pub user_token: Account<'info, TokenAccount>,
+
+    /// Treasury vault that receives the upgrade cost.
+    #[account(mut, address = config.reward_vault @ BitcoinError::InvalidParam)]
+    pub reward_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: blacklist marker PDA [SEED_BLACKLIST, owner]; validated in handler.
+    pub blacklist: UncheckedAccount<'info>,
 
     /// CHECK: PDA mint/update authority.
     #[account(seeds = [SEED_MINT_AUTH], bump = config.mint_auth_bump)]
     pub mint_authority: UncheckedAccount<'info>,
-
-    #[account(address = config.collection_mint @ BitcoinError::MintMismatch)]
-    pub collection_mint: Account<'info, Mint>,
-    /// CHECK: Collection metadata (size updated by Token Metadata).
-    #[account(mut)]
-    pub collection_metadata: UncheckedAccount<'info>,
-    /// CHECK: Collection master edition.
-    pub collection_master_edition: UncheckedAccount<'info>,
 
     // ---- Sacrificed NFT A ----
     #[account(mut)]
@@ -142,6 +144,12 @@ pub struct Sacrifice<'info> {
 }
 
 pub fn sacrifice(ctx: Context<Sacrifice>, name: String, uri: String) -> Result<()> {
+    require_not_blacklisted(
+        &ctx.accounts.blacklist.to_account_info(),
+        ctx.program_id,
+        &ctx.accounts.owner.key(),
+    )?;
+
     // Validate the pair.
     require_keys_neq!(
         ctx.accounts.mint_a.key(),
@@ -160,29 +168,28 @@ pub fn sacrifice(ctx: Context<Sacrifice>, name: String, uri: String) -> Result<(
         BitcoinError::GrailNotForgeable
     );
 
-    // Burn the upgrade cost in tokens.
+    // Upgrade cost goes back to the treasury (reward vault), not burned.
     let cost = ctx.accounts.config.upgrade_cost[from_tier as usize];
     if cost > 0 {
-        burn(
+        transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
-                Burn {
-                    mint: ctx.accounts.token_mint.to_account_info(),
+                Transfer {
                     from: ctx.accounts.user_token.to_account_info(),
+                    to: ctx.accounts.reward_vault.to_account_info(),
                     authority: ctx.accounts.owner.to_account_info(),
                 },
             ),
             cost,
         )?;
         let config = &mut ctx.accounts.config;
-        config.total_burned = config
-            .total_burned
+        config.pool_remaining = config
+            .pool_remaining
             .checked_add(cost)
             .ok_or(BitcoinError::MathOverflow)?;
     }
 
-    // Burn both sacrificed NFTs (also decrements the sized collection).
-    let collection_metadata_key = ctx.accounts.collection_metadata.key();
+    // Burn both sacrificed (standalone, non-collection) NFTs.
     burn_nft(
         CpiContext::new(
             ctx.accounts.token_metadata_program.to_account_info(),
@@ -194,9 +201,8 @@ pub fn sacrifice(ctx: Context<Sacrifice>, name: String, uri: String) -> Result<(
                 edition: ctx.accounts.edition_a.to_account_info(),
                 spl_token: ctx.accounts.token_program.to_account_info(),
             },
-        )
-        .with_remaining_accounts(vec![ctx.accounts.collection_metadata.to_account_info()]),
-        Some(collection_metadata_key),
+        ),
+        None,
     )?;
     burn_nft(
         CpiContext::new(
@@ -209,9 +215,8 @@ pub fn sacrifice(ctx: Context<Sacrifice>, name: String, uri: String) -> Result<(
                 edition: ctx.accounts.edition_b.to_account_info(),
                 spl_token: ctx.accounts.token_program.to_account_info(),
             },
-        )
-        .with_remaining_accounts(vec![ctx.accounts.collection_metadata.to_account_info()]),
-        Some(collection_metadata_key),
+        ),
+        None,
     )?;
 
     // Forge the upgraded NFT.
@@ -258,10 +263,7 @@ pub fn sacrifice(ctx: Context<Sacrifice>, name: String, uri: String) -> Result<(
             uri,
             seller_fee_basis_points: 0,
             creators: Some(creators),
-            collection: Some(Collection {
-                verified: false,
-                key: ctx.accounts.collection_mint.key(),
-            }),
+            collection: None,
             uses: None,
         },
         true,
@@ -288,30 +290,11 @@ pub fn sacrifice(ctx: Context<Sacrifice>, name: String, uri: String) -> Result<(
         Some(0),
     )?;
 
-    verify_sized_collection_item(
-        CpiContext::new_with_signer(
-            ctx.accounts.token_metadata_program.to_account_info(),
-            VerifySizedCollectionItem {
-                payer: ctx.accounts.owner.to_account_info(),
-                metadata: ctx.accounts.new_metadata.to_account_info(),
-                collection_authority: ctx.accounts.mint_authority.to_account_info(),
-                collection_mint: ctx.accounts.collection_mint.to_account_info(),
-                collection_metadata: ctx.accounts.collection_metadata.to_account_info(),
-                collection_master_edition: ctx
-                    .accounts
-                    .collection_master_edition
-                    .to_account_info(),
-            },
-            signer,
-        ),
-        None,
-    )?;
-
     let miner = &mut ctx.accounts.new_miner;
     miner.owner = ctx.accounts.owner.key();
     miner.nft_mint = ctx.accounts.new_mint.key();
     miner.tier = to_tier;
-    miner.hashrate = TIER_HASHRATE[to_tier as usize];
+    miner.hashrate = ctx.accounts.config.tier_hashrate[to_tier as usize];
     miner.active = false;
     miner.tree_slot = 0;
     miner.team = Pubkey::default();

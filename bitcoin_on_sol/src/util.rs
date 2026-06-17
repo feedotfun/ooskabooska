@@ -1,6 +1,25 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::keccak;
 
+use crate::constants::SEED_BLACKLIST;
+use crate::errors::BitcoinError;
+
+/// Rejects the transaction if `wallet` is blacklisted. `blacklist_ai` must be the
+/// PDA [SEED_BLACKLIST, wallet]; if that marker account exists (owned by this
+/// program), the wallet is banned. A non-existent (system/empty) account passes.
+pub fn require_not_blacklisted(
+    blacklist_ai: &AccountInfo,
+    program_id: &Pubkey,
+    wallet: &Pubkey,
+) -> Result<()> {
+    let (expected, _) = Pubkey::find_program_address(&[SEED_BLACKLIST, wallet.as_ref()], program_id);
+    require_keys_eq!(*blacklist_ai.key, expected, BitcoinError::InvalidParam);
+    if blacklist_ai.owner == program_id && !blacklist_ai.data_is_empty() {
+        return err!(BitcoinError::Blacklisted);
+    }
+    Ok(())
+}
+
 /// Deterministically expand a 32-byte VRF seed into the `n`-th pseudo-random
 /// u64. Used to derive multiple independent draws (e.g. 3 small-block winners)
 /// from a single Switchboard randomness reveal.

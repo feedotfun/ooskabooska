@@ -71,6 +71,56 @@ pub mod bitcoin_on_sol {
         instructions::admin::set_team_params(ctx, creation_fee_lamports, max_members, teams_enabled)
     }
 
+    pub fn set_block_timing(
+        ctx: Context<AdminOnly>,
+        small_interval: i64,
+        big_interval: i64,
+    ) -> Result<()> {
+        instructions::admin::set_block_timing(ctx, small_interval, big_interval)
+    }
+
+    pub fn set_reward_bps(
+        ctx: Context<AdminOnly>,
+        small_min: u16,
+        small_max: u16,
+        big_min: u16,
+        big_max: u16,
+    ) -> Result<()> {
+        instructions::admin::set_reward_bps(ctx, small_min, small_max, big_min, big_max)
+    }
+
+    pub fn set_emission_base(ctx: Context<AdminOnly>, emission_base: u64) -> Result<()> {
+        instructions::admin::set_emission_base(ctx, emission_base)
+    }
+
+    pub fn set_halving(ctx: Context<AdminOnly>, halving_interval: u64) -> Result<()> {
+        instructions::admin::set_halving(ctx, halving_interval)
+    }
+
+    pub fn set_multiplier(ctx: Context<AdminOnly>, enabled: bool, bps: u32) -> Result<()> {
+        instructions::admin::set_multiplier(ctx, enabled, bps)
+    }
+
+    pub fn set_tier_hashrate(ctx: Context<AdminOnly>, hashrate: [u64; 5]) -> Result<()> {
+        instructions::admin::set_tier_hashrate(ctx, hashrate)
+    }
+
+    pub fn set_max_active_hr(ctx: Context<AdminOnly>, max_active_hr: u64) -> Result<()> {
+        instructions::admin::set_max_active_hr(ctx, max_active_hr)
+    }
+
+    pub fn set_game_enabled(ctx: Context<AdminOnly>, enabled: bool) -> Result<()> {
+        instructions::admin::set_game_enabled(ctx, enabled)
+    }
+
+    pub fn blacklist_add(ctx: Context<BlacklistAdd>, target: Pubkey) -> Result<()> {
+        instructions::admin::blacklist_add(ctx, target)
+    }
+
+    pub fn blacklist_remove(ctx: Context<BlacklistRemove>, target: Pubkey) -> Result<()> {
+        instructions::admin::blacklist_remove(ctx, target)
+    }
+
     // ---------------- Chest mint ----------------
     pub fn request_mint(ctx: Context<RequestMint>) -> Result<()> {
         instructions::mint::request_mint(ctx)

@@ -5,6 +5,7 @@ use crate::constants::*;
 use crate::errors::BitcoinError;
 use crate::events::{InviteCreated, TeamCreated, TeamDisbanded, TeamMembershipChanged};
 use crate::state::{Config, Team, TeamInvite, TeamNameRegistry, UserState};
+use crate::util::require_not_blacklisted;
 
 /// Initialize a freshly-created (init_if_needed) UserState if it is blank.
 fn ensure_user_state(user_state: &mut UserState, owner: Pubkey, bump: u8) {
@@ -62,10 +63,18 @@ pub struct CreateTeam<'info> {
     #[account(mut, address = config.admin @ BitcoinError::InvalidParam)]
     pub fee_destination: SystemAccount<'info>,
 
+    /// CHECK: blacklist marker PDA [SEED_BLACKLIST, authority]; validated in handler.
+    pub blacklist: UncheckedAccount<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
 pub fn create_team(ctx: Context<CreateTeam>, name: String) -> Result<()> {
+    require_not_blacklisted(
+        &ctx.accounts.blacklist.to_account_info(),
+        ctx.program_id,
+        &ctx.accounts.authority.key(),
+    )?;
     require!(ctx.accounts.config.teams_enabled, BitcoinError::TeamsDisabled);
     require!(is_valid_team_name(&name), BitcoinError::InvalidTeamName);
 
@@ -327,19 +336,19 @@ pub fn admin_kick_member(ctx: Context<AdminKickMember>) -> Result<()> {
 
 #[derive(Accounts)]
 pub struct DisbandTeam<'info> {
-    /// Either the team owner or the program admin may disband.
+    /// Only the program admin may disband. The team leader can neither leave nor
+    /// disband their own team.
+    #[account(address = config.admin @ BitcoinError::Unauthorized)]
     pub authority: Signer<'info>,
 
     #[account(seeds = [SEED_CONFIG], bump = config.bump)]
     pub config: Account<'info, Config>,
 
-    /// Disband only when the owner is the last member (member_count == 1).
+    /// Disband only when the owner is the last member (member_count <= 1).
     #[account(
         mut,
         close = team_authority,
-        constraint = team.member_count <= 1 @ BitcoinError::TeamNotEmpty,
-        constraint = authority.key() == team.authority || authority.key() == config.admin
-            @ BitcoinError::Unauthorized
+        constraint = team.member_count <= 1 @ BitcoinError::TeamNotEmpty
     )]
     pub team: Account<'info, Team>,
 

@@ -49,6 +49,29 @@ pub struct Config {
     /// Whether new teams may be created.
     pub teams_enabled: bool,
 
+    // Block timing + emission (admin-configurable)
+    /// Seconds between small / big blocks.
+    pub small_interval: i64,
+    pub big_interval: i64,
+    /// Per-block reward range in basis points of `emission_base` (random via VRF).
+    pub small_bps_min: u16,
+    pub small_bps_max: u16,
+    pub big_bps_min: u16,
+    pub big_bps_max: u16,
+    /// Base amount (token base units) that block reward percentages apply to.
+    pub emission_base: u64,
+    /// Total settled blocks (small + big); drives halving.
+    pub total_blocks: u64,
+    /// Optional global reward multiplier (basis points; 10000 = 1x).
+    pub global_multiplier_bps: u32,
+    pub multiplier_enabled: bool,
+    /// Hashrate per tier (admin nerf/buff). Index by tier id.
+    pub tier_hashrate: [u64; TIER_COUNT],
+    /// Max active hashrate a single wallet may run at once.
+    pub max_active_hr: u64,
+    /// Master on/off switch for the mining game.
+    pub game_enabled: bool,
+
     pub paused: bool,
     pub bump: u8,
     pub vault_auth_bump: u8,
@@ -86,6 +109,8 @@ pub struct UserState {
     /// Membership is per wallet; a miner inherits this team when it is activated.
     pub team: Pubkey,
     pub bump: u8,
+    /// Sum of hashrate of this wallet's currently-active miners (capped).
+    pub active_hashrate: u64,
 }
 
 impl UserState {
@@ -136,6 +161,15 @@ pub struct Team {
     /// Accumulated reward per unit of hashrate, scaled by ACC_SCALE.
     pub acc_reward_per_hashrate: u128,
     pub member_count: u32,
+    pub bump: u8,
+}
+
+/// Marks a wallet as blacklisted. Existence of PDA [SEED_BLACKLIST, wallet]
+/// means the wallet is banned from minting / activating / creating teams.
+#[account]
+#[derive(InitSpace)]
+pub struct Blacklist {
+    pub wallet: Pubkey,
     pub bump: u8,
 }
 

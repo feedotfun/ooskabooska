@@ -71,6 +71,14 @@ pub enum BitcoinError {
     #[msg("This wallet has reached the 5 NFT mint limit")]
     MintLimitReached,
 
+    // Game / moderation
+    #[msg("This wallet is blacklisted")]
+    Blacklisted,
+    #[msg("The mining game is currently disabled")]
+    GameDisabled,
+    #[msg("Activating this miner would exceed your active hashrate cap")]
+    HashrateCapExceeded,
+
     // Sacrifice / upgrade
     #[msg("Both NFTs must be the same tier")]
     TierMismatch,

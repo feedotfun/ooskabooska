@@ -23,9 +23,28 @@ pub const TOTAL_NFT_SUPPLY: u32 = 2100;
 /// Highest tier reachable through sacrifice (Grail is mint-only).
 pub const MAX_SACRIFICE_RESULT_TIER: u8 = TIER_LEGENDARY;
 
-/// Mining cadence, in seconds.
-pub const SMALL_BLOCK_INTERVAL: i64 = 5 * 60; // 5 minutes
+/// Default mining cadence, in seconds (admin-configurable in Config).
+pub const SMALL_BLOCK_INTERVAL: i64 = 6 * 60; // 6 minutes
 pub const BIG_BLOCK_INTERVAL: i64 = 30 * 60; // 30 minutes
+
+/// Default per-block reward range, in basis points of `emission_base`.
+/// Small: 0.03%-0.10%, Big: 0.20%-0.50%. Random per block via VRF.
+pub const DEFAULT_SMALL_BPS_MIN: u16 = 3;
+pub const DEFAULT_SMALL_BPS_MAX: u16 = 10;
+pub const DEFAULT_BIG_BPS_MIN: u16 = 20;
+pub const DEFAULT_BIG_BPS_MAX: u16 = 50;
+
+/// Default halving cadence (every N settled blocks).
+pub const DEFAULT_HALVING_INTERVAL: u64 = 4200;
+
+/// Default max active hashrate per wallet.
+pub const DEFAULT_MAX_ACTIVE_HR: u64 = 800;
+
+/// Default global reward multiplier (10000 bps = 1x), disabled by default.
+pub const DEFAULT_MULTIPLIER_BPS: u32 = 10_000;
+
+/// Basis-point denominator.
+pub const BPS_DENOM: u64 = 10_000;
 
 /// Winners drawn per block type.
 pub const SMALL_BLOCK_WINNERS: u8 = 3;
@@ -97,6 +116,8 @@ pub const SEED_MINT_AUTH: &[u8] = b"mint_auth";
 pub const SEED_INVITE: &[u8] = b"invite";
 /// Registry PDA that makes team names globally unique: [SEED_TEAM_NAME, name].
 pub const SEED_TEAM_NAME: &[u8] = b"team_name";
+/// Blacklist marker PDA: [SEED_BLACKLIST, wallet].
+pub const SEED_BLACKLIST: &[u8] = b"blacklist";
 
 /// Returns the tier id for a uniformly random value given the remaining
 /// per-tier supply. The pick is weighted by remaining counts, which makes the
